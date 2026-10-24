@@ -537,121 +537,189 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     };
     run().catch(handleError);
   </script>
-<!-- 精準鎖定 'all' 變數防休眠預約腳本 -->
+<!-- ======================================================= -->
+<!-- 全情境相容版：螢幕常亮 + 手動鎖屏背景保鮮 (MediaSession) + 雙軌響鈴 -->
+<!-- ======================================================= -->
+<video id="no-sleep-video" playsinline loop muted style="position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;">
+  <source src="data:video/mp4;base64,AAAAIGZ0eXBpc29tAAAAAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAAdtZGF0AAAAAAA=" type="video/mp4">
+</video>
+
 <script>
-  window.alarmAudioCtx = null;
-  let isHooked = false;
+  const videoElem = document.getElementById('no-sleep-video');
+  const alarmSound = new Audio("alarm_2.wav");
 
-  async function getScratchAudioBuffer(soundKeyword, audioCtx) {
-    try {
-      const vm = window.vm || (window.scaffolding && window.scaffolding.vm);
-      if (!vm) return null;
-      for (const target of vm.runtime.targets) {
-        const sounds = (target.sprite && target.sprite.sounds) || target.sounds || [];
-        const sound = sounds.find(s => s.name.includes(soundKeyword) || s.name.toLowerCase().includes('alarm'));
-        if (sound && sound.asset && sound.asset.data) {
-          const rawData = sound.asset.data;
-          const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-          return await audioCtx.decodeAudioData(arrayBuffer);
-        }
-      }
-    } catch (e) {}
-    return null;
+  // 1. 建立背景音訊保鮮串流 (向 OS 宣告為背景播放器，防止手動鎖屏凍結)
+  const silentAudio = new Audio("data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQQAAAAAAA==");
+  silentAudio.loop = true;
+
+  const AudioContext = window.AudioContext || window.webkitAudioContext;
+  let audioCtx = null;
+  let alarmBuffer = null;
+  let wakeLock = null;
+
+  // 2. 預載並解碼 alarm_2.wav 音效檔
+  fetch("alarm_2.wav")
+    .then(res => {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res.arrayBuffer();
+    })
+    .then(buffer => {
+      audioCtx = audioCtx || new AudioContext();
+      return audioCtx.decodeAudioData(buffer);
+    })
+    .then(decoded => {
+      alarmBuffer = decoded;
+      console.log("✅ 音效已完全載入記憶體！");
+    })
+    .catch(err => console.error("❌ 音效載入失敗:", err));
+
+  // 3. 註冊系統級媒體卡片 (讓手機鎖屏時認為是 Spotify 類型的 App)
+  function registerMediaSession() {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: '番茄鐘專注倒數中...',
+        artist: '鎖屏背景保鮮中',
+        album: '時間到將自動響鈴'
+      });
+      navigator.mediaSession.setActionHandler('play', () => {});
+      navigator.mediaSession.setActionHandler('pause', () => {});
+    }
   }
 
-  // 【核心修正】僅搜尋精準名稱為 'all' 的變數，避開其他「時間」變數
-  function getScratchSeconds() {
+  // 4. 權限解鎖與背景防休眠啟動
+  async function silentUnlock() {
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') {
+      try { await audioCtx.resume(); } catch(e) {}
+    }
+
+    alarmSound.load();
+    alarmSound.play().then(() => {
+      alarmSound.pause();
+      alarmSound.currentTime = 0;
+    }).catch(() => {});
+
+    if (videoElem) {
+      videoElem.play().catch(() => {});
+    }
+
     try {
-      const vm = window.vm || (window.scaffolding && window.scaffolding.vm);
-      if (vm) {
-        for (const target of vm.runtime.targets) {
-          for (const id in target.variables) {
-            const v = target.variables[id];
-            if (v.name.toLowerCase() === 'all') {
-              return parseFloat(v.value);
-            }
-          }
-        }
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
       }
-    } catch (e) {}
-    return null;
+    } catch (err) {}
   }
 
-  async function scheduleInfiniteCycles() {
-    if (window.alarmAudioCtx) {
+  window.addEventListener('click', silentUnlock, { passive: true });
+  window.addEventListener('touchstart', silentUnlock, { passive: true });
+
+  // 5. 雙保險響鈴機制
+  async function ringAlarm(repeatTimes) {
+    // 停止背景保鮮音訊
+    silentAudio.pause();
+    silentAudio.currentTime = 0;
+
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') {
+      try { await audioCtx.resume(); } catch(e) {}
+    }
+
+    let successWebAudio = false;
+
+    if (audioCtx && audioCtx.state === 'running' && alarmBuffer) {
       try {
-        await window.alarmAudioCtx.close();
-      } catch (e) {}
-    }
-
-    window.alarmAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    await window.alarmAudioCtx.resume();
-
-    const audioBuffer = await getScratchAudioBuffer('鬧鐘', window.alarmAudioCtx);
-
-    // 精準讀取 Scratch 裡的 'all' 變數值（讀取失敗時預設 1500）
-    const workTime = getScratchSeconds() || 1500; 
-    const restTime = 300;      // 休息時間 5 分鐘 (300秒)
-    const soundDuration = 10;  // 鬧鐘響 10 秒
-    const totalRounds = 10;    // 預約 10 輪
-
-    let timeOffset = window.alarmAudioCtx.currentTime;
-
-    for (let r = 0; r < totalRounds; r++) {
-      let workAlarmTime = timeOffset + workTime;
-      play10Times(audioBuffer, workAlarmTime);
-
-      let restAlarmTime = workAlarmTime + soundDuration + restTime;
-      play10Times(audioBuffer, restAlarmTime);
-
-      timeOffset = restAlarmTime + soundDuration;
-    }
-
-    console.log("【讀取成功】已鎖定 'all' 變數，目前設定秒數為：" + workTime + " 秒");
-  }
-
-  function play10Times(buffer, startTime) {
-    for (let i = 0; i < 10; i++) {
-      if (buffer) {
-        let source = window.alarmAudioCtx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(window.alarmAudioCtx.destination);
-        source.start(startTime + i);
-      } else {
-        let osc = window.alarmAudioCtx.createOscillator();
-        let gain = window.alarmAudioCtx.createGain();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(880, window.alarmAudioCtx.currentTime);
-        gain.gain.setValueAtTime(0.5, window.alarmAudioCtx.currentTime);
-        osc.connect(gain);
-        gain.connect(window.alarmAudioCtx.destination);
-        osc.start(startTime + i);
-        osc.stop(startTime + i + 0.3);
+        const duration = alarmBuffer.duration;
+        const gap = 0.15;
+        for (let i = 0; i < repeatTimes; i++) {
+          const source = audioCtx.createBufferSource();
+          source.buffer = alarmBuffer;
+          source.connect(audioCtx.destination);
+          source.start(audioCtx.currentTime + i * (duration + gap));
+        }
+        successWebAudio = true;
+      } catch (e) {
+        console.warn("Web Audio 播放失敗，切換至 HTML5 備用方案", e);
       }
     }
-  }
 
-  function hookScratchVM() {
-    const vm = window.vm || (window.scaffolding && window.scaffolding.vm);
-    if (vm && !isHooked) {
-      isHooked = true;
-      const originalStartHats = vm.runtime.startHats.bind(vm.runtime);
-      
-      vm.runtime.startHats = function(requestedHat, optFields, optVariables) {
-        if (requestedHat === 'event_whenbroadcastreceived' && optFields && optFields.BROADCAST_OPTION === '開始計時') {
-          scheduleInfiniteCycles();
+    if (!successWebAudio) {
+      let count = 0;
+      alarmSound.onended = () => {
+        count++;
+        if (count < repeatTimes) {
+          alarmSound.currentTime = 0;
+          alarmSound.play().catch(e => console.error(e));
         }
-        return originalStartHats(requestedHat, optFields, optVariables);
       };
+      alarmSound.currentTime = 0;
+      alarmSound.play().catch(e => console.error(e));
     }
   }
 
-  document.addEventListener('click', function() {
-    hookScratchVM();
-  });
-  document.addEventListener('touchstart', function() {
-    hookScratchVM();
-  });
+  // 6. 高頻 Web Worker 背景計時器
+  const workerCode = `
+    let timer = null;
+    self.onmessage = function(e) {
+      if (e.data.cmd === 'start') {
+        const targetTime = e.data.targetTime;
+        if (timer) clearInterval(timer);
+        timer = setInterval(() => {
+          if (Date.now() >= targetTime) {
+            clearInterval(timer);
+            self.postMessage('TIME_UP');
+          }
+        }, 20);
+      }
+    };
+  `;
+  const blob = new Blob([workerCode], { type: 'application/javascript' });
+  const worker = new Worker(URL.createObjectURL(blob));
+
+  let currentStageMode = 1;
+
+  worker.onmessage = function(e) {
+    if (e.data === 'TIME_UP') {
+      const repeatTimes = (currentStageMode === 1) ? 10 : 5;
+      ringAlarm(repeatTimes);
+    }
+  };
+
+  // 7. 啟動計時主邏輯
+  function startPomodoroBySeconds(seconds, stageMode) {
+    currentStageMode = stageMode;
+    silentUnlock();
+    registerMediaSession();
+
+    // 啟動背景音訊串流，確保手動按電源鍵鎖屏時，手機 CPU 不會關閉
+    silentAudio.currentTime = 0;
+    silentAudio.play().catch(e => console.log("背景音訊啟動受阻:", e));
+
+    const targetTime = Date.now() + seconds * 1000;
+    worker.postMessage({ cmd: 'start', targetTime: targetTime });
+  }
+
+  // 8. 監聽 Scratch 變數
+  setInterval(() => {
+    if (window.P2 && P2.p2 && P2.p2.vm) {
+      const vm = P2.p2.vm;
+      const stage = vm.runtime.getTargetForStage();
+
+      if (stage && stage.variables) {
+        const vars = Object.values(stage.variables);
+
+        const triggerVar = vars.find(v => v.name === '啟動觸發');
+        const allVar = vars.find(v => v.name === 'all');
+        const stageVar = vars.find(v => v.name === '階段');
+
+        if (triggerVar && Number(triggerVar.value) === 1) {
+          triggerVar.value = 0;
+          const seconds = allVar ? Number(allVar.value) : 1500;
+          const stageVal = stageVar ? Number(stageVar.value) : 1;
+          startPomodoroBySeconds(seconds, stageVal);
+        }
+      }
+    }
+  }, 50);
 </script>
 </body>
 </html>
